@@ -15,6 +15,12 @@ const code   = (new URLSearchParams(location.search).get("code") || "").trim();
    photo shows instead. */
 async function resolveAssets(fs, db, code, cfg){
   if (!cfg) return cfg;
+  /* The mp3 lives in up to ~40 chunk documents, so start pulling it right away
+     and let it run alongside the photo reads — the guest waits for the slower
+     of the two instead of for both. (It still has to be ready before the page
+     paints: iOS only allows playback for a track that existed at the moment
+     the guest tapped "open", so the URL cannot be swapped in later.) */
+  const musicP = resolveMusic(fs, db, code, cfg);
   cfg.__photos__ = {};
   const slots = new Set();
   Object.values(cfg.photos || {}).forEach(v => {
@@ -39,7 +45,7 @@ async function resolveAssets(fs, db, code, cfg){
   if (String(cfg.venue && cfg.venue.photoUrl || "").indexOf("asset:") === 0)
     cfg.venue.photoUrl = pick("venue");
   delete cfg.__photos__;
-  await resolveMusic(fs, db, code, cfg);
+  await musicP;
   return cfg;
 }
 
@@ -61,22 +67,31 @@ async function slotPhotos(fs, db, code, slot){
 
 /* uploaded mp3 = chunked Firestore docs (assets/music + assets/music/chunks/<n>).
    Guests reassemble the base64 chunks into a normal blob audio URL — still
-   100% Firestore, no Storage bucket, no card. */
+   100% Firestore, no Storage bucket, no card.
+   The reassembled URL is cached per track signature: the realtime listener
+   fires on every organiser edit, and a 15 MB track must not be re-downloaded
+   each time. A new upload changes the signature → fresh chunks. */
+let MUSIC_CACHE = { key: "", url: "" };
+const musicSig = (code, d) => [code, d.chunks, d.mime || "",
+  d.updatedAt && typeof d.updatedAt.toMillis === "function" ? d.updatedAt.toMillis() : ""].join("|");
+
 async function resolveMusic(fs, db, code, cfg){
   const m = String(cfg && cfg.media && cfg.media.music || "");
   if (m.indexOf("asset:") !== 0) return;
   try {
     const man = await fs.getDoc(fs.doc(db, "weddings", code, "assets", "music"));
     if (!man.exists() || !man.data().chunks){ cfg.media.music = ""; return; }
+    const d = man.data(), sig = musicSig(code, d);
+    if (MUSIC_CACHE.key === sig && MUSIC_CACHE.url){ cfg.media.music = MUSIC_CACHE.url; return; }
     const atob2 = s => { const b = atob(s), u = new Uint8Array(b.length);
       for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u; };
-    const snaps = await Promise.all(Array.from({ length: man.data().chunks },
+    const snaps = await Promise.all(Array.from({ length: d.chunks },
       (_, i) => fs.getDoc(fs.doc(db, "weddings", code, "assets", "music", "chunks", String(i)))));
     const parts = snaps.filter(s => s.exists())
       .map(s => atob2(String(s.data().durl || "").split(",")[1] || ""));
-    cfg.media.music = parts.length
-      ? URL.createObjectURL(new Blob(parts, { type: man.data().mime || "audio/mpeg" }))
-      : "";
+    if (!parts.length){ cfg.media.music = ""; return; }
+    MUSIC_CACHE = { key: sig, url: URL.createObjectURL(new Blob(parts, { type: d.mime || "audio/mpeg" })) };
+    cfg.media.music = MUSIC_CACHE.url;
   } catch (e) { cfg.media.music = ""; }   // fallback: invitation uses its own music
 }
 
